@@ -1,0 +1,14 @@
+{
+  // Pixel Hub SceneFlow — site estático servido pelo Cloudflare Workers (Static Assets)
+  "name": "pixel-hub-sceneflow",
+  "compatibility_date": "2025-05-05",
+
+  // Publica no subdomínio *.workers.dev da sua conta (registre-o uma única vez no painel)
+  "workers_dev": true,
+
+  // Serve a pasta gerada pelo `npm run build` como aplicativo de página única
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  }
+}
