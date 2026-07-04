@@ -192,6 +192,35 @@ const Store = (() => {
   };
 })();
 const SAVE_KEY = "phsf:projeto:v1";
+const CLOUD_KEY = "phsf:nuvem:v1";
+
+// ============================================================================
+// 3b. NUVEM (Fase 2) — cliente da SceneFlow API (servidor Node próprio)
+// ============================================================================
+async function apiReq(cfg, path, { method = "GET", json, body, headers = {}, pub = false, asBlob = false } = {}) {
+  const base = String(cfg.url || "").replace(/\/+$/, "");
+  const h = { ...headers };
+  if (!pub) h["X-PH-Key"] = cfg.key || "";
+  if (json !== undefined) { h["Content-Type"] = "application/json"; body = JSON.stringify(json); }
+  let r;
+  try { r = await fetch(base + path, { method, headers: h, body }); }
+  catch (e) { throw new Error("Servidor inacessível — confira a URL da API e se o serviço está no ar."); }
+  if (!r.ok) {
+    let msg = null;
+    try { msg = (await r.json()).error; } catch (e) { /* corpo não-JSON */ }
+    throw new Error(msg || `Erro ${r.status} na API.`);
+  }
+  if (asBlob) return r.arrayBuffer();
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("json") ? r.json() : r.text();
+}
+function parseReviewLink() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const token = q.get("review"), api = q.get("api");
+    return token && api ? { token, api: decodeURIComponent(api) } : null;
+  } catch (e) { return null; }
+}
 
 // ============================================================================
 // 4. PARSERS DE IMPORTAÇÃO (GLB/glTF, OBJ, ZIP) — testados contra amostras Khronos
@@ -2290,6 +2319,9 @@ const initialDoc = () => ({
   shots: [],
   accent: "#F2A83C",
   scenePresets: [],
+  cloudId: null,
+  reviewToken: null,
+  reviewSyncAt: 0,
 });
 function docReducer(doc, a) {
   switch (a.type) {
@@ -2303,6 +2335,7 @@ function docReducer(doc, a) {
     case "SHOTS": return { ...doc, shots: a.shots };
     case "SHOT": return { ...doc, shots: doc.shots.map(s => s.id === a.id ? { ...s, ...a.patch, rev: a.bump ? s.rev + 1 : s.rev } : s) };
     case "PRESET_ADD": return { ...doc, scenePresets: [...doc.scenePresets, a.preset] };
+    case "DOC": return { ...doc, ...a.patch };
     default: return doc;
   }
 }
@@ -2310,7 +2343,7 @@ function docReducer(doc, a) {
 // ============================================================================
 // 12. APLICATIVO
 // ============================================================================
-export default function App() {
+function App() {
   const hostRef = useRef(null);
   const canvasRef = useRef(null);
   const smRef = useRef(null);
@@ -2406,7 +2439,7 @@ export default function App() {
   // -------- persistência
   const buildSave = useCallback(() => {
     const s = sm();
-    return JSON.stringify({ savedAt: Date.now(), doc: docRef.current, ov: s ? s.collectOverrides() : null, imports: s ? [...s.reg.values()].filter(e => e.imported).map(e => ({ name: e.name, file: e.imported.fileName, stats: e.imported.stats })) : [] });
+    return JSON.stringify({ savedAt: Date.now(), doc: docRef.current, ov: s ? s.collectOverrides() : null, imports: s ? [...s.reg.values()].filter(e => e.imported).map(e => ({ name: e.name, file: e.imported.fileName, stats: e.imported.stats, cloudId: e.imported.cloudId || null, p: e.obj.position.toArray(), rY: e.obj.rotation.y, s: e.obj.scale.x })) : [] });
   }, []);
   const saveNow = useCallback(async (silent = false) => {
     const ok = await Store.set(SAVE_KEY, buildSave());
@@ -2419,11 +2452,140 @@ export default function App() {
     try {
       const data = JSON.parse(raw);
       restoreSnap(JSON.stringify({ doc: { ...initialDoc(), ...data.doc }, ov: data.ov }));
-      if (data.imports && data.imports.length) toast(`Este projeto tinha ${data.imports.length} modelo(s) importado(s): ${data.imports.map(i => i.file).join(", ")}. A geometria não é persistida no navegador — reimporte os arquivos.`, "warn", 9000);
+      if (data.imports && data.imports.length) {
+        const withCloud = data.imports.filter(i => i.cloudId);
+        if (withCloud.length && cloudRef.current) { toast(`Baixando ${withCloud.length} maquete(s) da nuvem…`, "info", 3500); rehydrateImports(data.imports); }
+        else toast(`Este projeto tinha ${data.imports.length} modelo(s) importado(s): ${data.imports.map(i => i.file).join(", ")}. Sem cópia na nuvem, a geometria não persiste — reimporte os arquivos.`, "warn", 9000);
+      }
       setDirty(false); setSavedAt(data.savedAt || Date.now());
       return true;
     } catch (e) { toast("Não foi possível restaurar o salvamento anterior.", "err"); return false; }
   }, [restoreSnap, toast]);
+
+  // -------- nuvem (Fase 2): projetos, maquetes persistentes, revisão do cliente
+  const [cloud, setCloud] = useState(null);
+  const cloudRef = useRef(null);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const saveCloudCfg = useCallback((cfg) => {
+    cloudRef.current = cfg; setCloud(cfg);
+    Store.set(CLOUD_KEY, cfg ? JSON.stringify(cfg) : "");
+    if (!cfg) Store.del(CLOUD_KEY);
+  }, []);
+  const cloudOn = !!(cloud && cloud.url && cloud.key);
+  const rehydrateImports = useCallback(async (imports) => {
+    const s = sm(); const cfg = cloudRef.current;
+    if (!s || !cfg) return 0;
+    let n = 0;
+    for (const im of imports || []) {
+      if (!im.cloudId) continue;
+      try {
+        const ab = await apiReq(cfg, `/api/assets/${im.cloudId}`, { asBlob: true });
+        const file = new File([ab], im.file, { type: "model/gltf-binary" });
+        const res = await s.importModel(file, () => {});
+        if (res && res.id) {
+          const e = s.reg.get(res.id);
+          e.imported.cloudId = im.cloudId;
+          if (im.p) s.setTransform(res.id, { p: im.p, rY: im.rY, s: im.s });
+          n++;
+        }
+      } catch (e) { toast(`Não foi possível baixar “${im.file}” da nuvem: ${e.message}`, "err", 7000); }
+    }
+    if (n) { toast(`${n} maquete(s) restaurada(s) da nuvem com posição e correções.`, "ok", 6000); force(); }
+    return n;
+  }, [toast]);
+  const ensureCloudProject = useCallback(async () => {
+    const cfg = cloudRef.current;
+    if (!cfg) throw new Error("Nuvem não configurada.");
+    if (docRef.current.cloudId) return docRef.current.cloudId;
+    const d = docRef.current;
+    const res = await apiReq(cfg, "/api/projects", { method: "POST", json: { name: d.project.name, client: d.project.client, type: d.project.type, doc: JSON.parse(buildSave()) } });
+    dispatch({ type: "DOC", patch: { cloudId: res.id } });
+    docRef.current = { ...docRef.current, cloudId: res.id };
+    return res.id;
+  }, [buildSave]);
+  const cloudSave = useCallback(async () => {
+    const cfg = cloudRef.current;
+    if (!cfg) { setModal({ kind: "nuvem" }); return; }
+    setCloudBusy(true);
+    try {
+      const id = await ensureCloudProject();
+      const d = docRef.current;
+      await apiReq(cfg, "/api/projects", { method: "POST", json: { id, name: d.project.name, client: d.project.client, type: d.project.type, doc: JSON.parse(buildSave()) } });
+      setDirty(false); setSavedAt(Date.now());
+      const semNuvem = sm() ? [...sm().reg.values()].filter(e => e.imported && !e.imported.cloudId).length : 0;
+      toast(semNuvem
+        ? `Projeto salvo na nuvem. Atenção: ${semNuvem} maquete(s) importada(s) antes da conexão não têm cópia na nuvem — reimporte-as para persistir a geometria.`
+        : "Projeto salvo na nuvem — abra em qualquer máquina com a mesma chave.", semNuvem ? "warn" : "ok", 7000);
+    } catch (e) { toast(`Falha ao salvar na nuvem: ${e.message}`, "err", 7000); }
+    finally { setCloudBusy(false); }
+  }, [ensureCloudProject, buildSave, toast]);
+  const cloudOpenProject = useCallback(async (id) => {
+    const cfg = cloudRef.current;
+    setCloudBusy(true);
+    try {
+      const data = await apiReq(cfg, `/api/projects/${id}`);
+      const save = data.doc || {};
+      snapshot();
+      restoreSnap(JSON.stringify({ doc: { ...initialDoc(), ...save.doc, cloudId: data.id }, ov: save.ov }));
+      setModal(null);
+      const withCloud = (save.imports || []).filter(i => i.cloudId);
+      if (withCloud.length) { toast(`Baixando ${withCloud.length} maquete(s) da nuvem…`, "info", 3500); await rehydrateImports(save.imports); }
+      const semNuvem = (save.imports || []).length - withCloud.length;
+      if (semNuvem > 0) toast(`${semNuvem} maquete(s) deste projeto não têm cópia na nuvem — reimporte os arquivos originais.`, "warn", 8000);
+      toast(`Projeto “${data.name}” aberto da nuvem.`, "ok");
+      setDirty(false); setSavedAt(data.updated_at);
+    } catch (e) { toast(`Falha ao abrir da nuvem: ${e.message}`, "err", 7000); }
+    finally { setCloudBusy(false); }
+  }, [snapshot, restoreSnap, rehydrateImports, toast]);
+  const makeReviewLink = useCallback(async () => {
+    const cfg = cloudRef.current; const s = sm();
+    if (!cfg || !s) return;
+    const shots = docRef.current.shots.filter(x => !x.muted);
+    if (!shots.length) { toast("Crie tomadas antes de gerar o link de revisão.", "warn"); return; }
+    setCloudBusy(true);
+    try {
+      const id = await ensureCloudProject();
+      const payload = {
+        projectName: docRef.current.project.name,
+        client: docRef.current.project.client,
+        aspect: docRef.current.aspect,
+        total: shots.reduce((a, x) => a + x.dur, 0),
+        shots: shots.map(x => ({ id: x.id, name: x.name, dur: x.dur, move: x.move, status: x.status, thumb: thumbs[x.id] || s.shotThumb(x) })),
+      };
+      const res = await apiReq(cfg, "/api/reviews", { method: "POST", json: { projectId: id, payload } });
+      const url = `${window.location.origin}${window.location.pathname}?review=${res.token}&api=${encodeURIComponent(cfg.url)}`;
+      dispatch({ type: "DOC", patch: { reviewToken: res.token, reviewSyncAt: Date.now() } });
+      setModal({ kind: "share", reviewUrl: url });
+      try { await navigator.clipboard.writeText(url); toast("Link de revisão criado e copiado — envie ao cliente.", "ok", 6000); }
+      catch (e) { toast("Link de revisão criado — copie no modal.", "ok", 5000); }
+    } catch (e) { toast(`Falha ao gerar link: ${e.message}`, "err", 7000); }
+    finally { setCloudBusy(false); }
+  }, [thumbs, ensureCloudProject, toast]);
+  const pullReviews = useCallback(async () => {
+    const cfg = cloudRef.current;
+    const tok = docRef.current.reviewToken;
+    if (!cfg || !tok) return;
+    setCloudBusy(true);
+    try {
+      const fb = await apiReq(cfg, `/api/reviews/${tok}/feedback`);
+      const since = docRef.current.reviewSyncAt || 0;
+      const newC = fb.comments.filter(c => c.created_at > since);
+      const latest = {};
+      for (const a of fb.approvals) if (a.shot_id) latest[a.shot_id] = a;
+      snapshot();
+      const shots = docRef.current.shots.map(x => {
+        const add = newC.filter(c => c.shot_id === x.id).map(c => ({ text: `${c.author}: ${c.text}`, at: c.created_at }));
+        const ap = latest[x.id];
+        return { ...x, comments: [...(x.comments || []), ...add], status: ap ? (ap.decision === "aprovado" ? "aprovado" : "ajustes") : x.status };
+      });
+      dispatch({ type: "SHOTS", shots });
+      dispatch({ type: "DOC", patch: { reviewSyncAt: Date.now() } });
+      const nA = Object.values(latest).filter(a => a.decision === "aprovado").length;
+      const nJ = Object.values(latest).filter(a => a.decision === "ajustes").length;
+      toast(`Revisões sincronizadas: ${newC.length} comentário(s) novo(s), ${nA} aprovada(s), ${nJ} com ajustes.`, "ok", 7000);
+    } catch (e) { toast(`Falha ao puxar revisões: ${e.message}`, "err", 6000); }
+    finally { setCloudBusy(false); }
+  }, [snapshot, toast]);
 
   // -------- inicialização do motor 3D
   useEffect(() => {
@@ -2449,6 +2611,7 @@ export default function App() {
     s.setGeo(docRef.current.geo);
     setReady(true);
     Store.get(SAVE_KEY).then(r => { if (r) setRestorable(true); });
+    Store.get(CLOUD_KEY).then(r => { if (r) { try { const c = JSON.parse(r); cloudRef.current = c; setCloud(c); } catch (e) {} } });
     if (!docRef.current.project.firstPreviewAt) dispatch({ type: "PROJECT", patch: { firstPreviewAt: Date.now() } });
     return () => s.dispose();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2607,6 +2770,18 @@ export default function App() {
             continue;
           }
           dispatch({ type: "PROJECT", patch: { importedAt: docRef.current.project.importedAt || Date.now() } });
+          if (cloudRef.current) {
+            (async () => {
+              try {
+                const pid = await ensureCloudProject();
+                const bytes = await file.arrayBuffer();
+                const up = await apiReq(cloudRef.current, `/api/assets?projectId=${encodeURIComponent(pid)}&fileName=${encodeURIComponent(file.name)}`, { method: "POST", body: bytes, headers: { "Content-Type": "application/octet-stream" } });
+                const e2 = sm().reg.get(res.id);
+                if (e2 && e2.imported) e2.imported.cloudId = up.id;
+                toast(`${file.name} enviado à nuvem (${fmtBytes(up.size)}) — a geometria agora persiste com o projeto.`, "ok", 6000);
+              } catch (e3) { toast(`Maquete importada localmente, mas o envio à nuvem falhou: ${e3.message}`, "warn", 7000); }
+            })();
+          }
           setSel(res.id); s.setSelected(res.id);
           s.frameSelection(res.id);
           setModal({ kind: "diag", targetId: res.id, diag: res.diag, fileName: file.name, stats: res.stats });
@@ -3305,10 +3480,30 @@ export default function App() {
   const startConversion = useCallback(async (file, adapterId = "demo") => {
     const job = { id: uid("conv"), file: file.name, size: file.size, adapter: adapterId, status: "enviando", message: "Preparando envio…" };
     setConvJobs(j => [...j, job]);
+    if (cloudRef.current) {
+      // caminho real: o arquivo é armazenado no servidor e entra na fila de verdade
+      try {
+        const pid = docRef.current.cloudId || await ensureCloudProject();
+        const bytes = await file.arrayBuffer();
+        const res = await apiReq(cloudRef.current, `/api/conversions?projectId=${encodeURIComponent(pid)}&fileName=${encodeURIComponent(file.name)}`, { method: "POST", body: bytes, headers: { "Content-Type": "application/octet-stream" } });
+        setConvJobs(js => js.map(x => x.id === job.id ? { ...x, id: res.id, server: true, status: "fila", message: "Armazenado no servidor. Na fila real, aguardando o worker de conversão (Fase 2b)." } : x));
+        toast(`${file.name} enviado ao servidor e enfileirado (${fmtBytes(file.size)}).`, "ok", 6000);
+      } catch (e) {
+        setConvJobs(js => js.map(x => x.id === job.id ? { ...x, status: "erro", message: `Falha no envio: ${e.message}` } : x));
+      }
+      return;
+    }
     const adapter = ConversionAdapters[adapterId];
     const done = await adapter.submit(job, (j2) => setConvJobs(js => js.map(x => x.id === job.id ? { ...x, ...j2 } : x)));
     setConvJobs(js => js.map(x => x.id === job.id ? { ...x, ...done } : x));
-  }, []);
+  }, [ensureCloudProject, toast]);
+  // com nuvem ativa, o modal de importação lista a fila real do servidor
+  useEffect(() => {
+    if (!modal || modal.kind !== "import" || !cloudRef.current || !docRef.current.cloudId) return;
+    apiReq(cloudRef.current, `/api/conversions?projectId=${encodeURIComponent(docRef.current.cloudId)}`)
+      .then(rows => setConvJobs(rows.map(r => ({ id: r.id, file: r.file_name, size: r.size, server: true, status: r.status, message: r.message }))))
+      .catch(() => {});
+  }, [modal]);
 
   const visShots = doc.shots;
   const scrubTo = useCallback((t) => { sm().scrub(clamp(t, 0, total)); }, [total]);
@@ -3479,6 +3674,21 @@ export default function App() {
         <div className="col" style={{ gap: 7 }}>
           <button className="btn" onClick={() => { setNewP({ name: "", client: "", venture: "", owner: "", location: "", type: PROJECT_TYPES[2], deadline: "", notes: "" }); setModal({ kind: "novo" }); }}><Plus size={14} />Novo projeto</button>
           <button className="btn" onClick={async () => { const ok = await loadSave(); if (ok) { setModal(null); toast("Projeto restaurado.", "ok"); } else toast("Nenhum salvamento encontrado.", "warn"); }}><FolderOpen size={14} />Restaurar projeto salvo</button>
+          <div className="seclabel" style={{ margin: "8px 2px 2px" }}><span>Nuvem Pixel Hub</span></div>
+          {cloudOn ? (
+            <>
+              <button className="btn" disabled={cloudBusy} onClick={() => { cloudSave(); setModal(null); }}><Upload size={14} />Salvar na nuvem</button>
+              <button className="btn" disabled={cloudBusy} onClick={async () => {
+                try {
+                  const list = await apiReq(cloudRef.current, "/api/projects");
+                  setModal({ kind: "nuvem-abrir", list });
+                } catch (e) { toast(`Falha ao listar projetos: ${e.message}`, "err", 6000); }
+              }}><FolderOpen size={14} />Abrir da nuvem</button>
+              <button className="btn ghost" onClick={() => setModal({ kind: "nuvem" })}><Settings size={14} />Servidor conectado — configurar</button>
+            </>
+          ) : (
+            <button className="btn" onClick={() => setModal({ kind: "nuvem" })}><Share2 size={14} />Conectar servidor da equipe…</button>
+          )}
           <button className="btn" onClick={() => { exportJSON(); }}><Download size={14} />Exportar projeto (JSON)</button>
           <label className="btn" style={{ cursor: "pointer" }}>
             <Upload size={14} />Importar projeto (JSON)
@@ -3704,18 +3914,87 @@ export default function App() {
       </Modal>
     );
     if (K === "share") return (
-      <Modal title="Compartilhar" icon={Share2} onClose={() => setModal(null)} width={460}>
-        <div className="hint">O protótipo roda inteiro no seu navegador — não existe servidor para hospedar links. Caminhos disponíveis hoje:</div>
-        <div className="col" style={{ gap: 6, marginTop: 10 }}>
-          <button className="btn" onClick={exportJSON}><FileJson size={13} />Enviar o arquivo do projeto (JSON)</button>
-          <button className="btn" onClick={doCapture}><ImageIcon size={13} />Enviar imagem do quadro atual</button>
-          <button className="btn" onClick={() => { setModal(null); doRecord(); }}><Film size={13} />Enviar prévia em vídeo (WebM)</button>
-        </div>
-        <SectionLabel>Fase 2</SectionLabel>
+      <Modal title="Compartilhar" icon={Share2} onClose={() => setModal(null)} width={500}>
+        <SectionLabel>Revisão do cliente {cloudOn ? null : <Stamp kind="f2">requer servidor</Stamp>}</SectionLabel>
+        {cloudOn ? (
+          <div className="col" style={{ gap: 6 }}>
+            <button className="btn primary" disabled={cloudBusy} onClick={makeReviewLink}>
+              {cloudBusy ? <Loader2 size={13} className="spin" /> : <Share2 size={13} />}Gerar link de revisão do cliente
+            </button>
+            {(modal.reviewUrl || doc.reviewToken) && (
+              <div className="card" style={{ padding: "9px 11px" }}>
+                <div className="hint" style={{ marginBottom: 6 }}>O cliente abre o link, vê o storyboard com miniaturas e pode <b>comentar</b> e <b>aprovar/pedir ajustes</b> por tomada — sem senha, o link é a chave.</div>
+                {modal.reviewUrl && (
+                  <div className="row" style={{ gap: 6 }}>
+                    <input readOnly value={modal.reviewUrl} onFocus={(e) => e.target.select()} style={{ flex: 1, fontSize: 10 }} className="mono" />
+                    <button className="btn sm" onClick={async () => { try { await navigator.clipboard.writeText(modal.reviewUrl); toast("Link copiado.", "ok", 2200); } catch (e) {} }}><Copy size={12} />Copiar</button>
+                  </div>
+                )}
+                {doc.reviewToken && (
+                  <button className="btn sm" style={{ marginTop: 8 }} disabled={cloudBusy} onClick={pullReviews}>
+                    <MessageSquare size={12} />Puxar revisões do cliente
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="col" style={{ gap: 6 }}>
+            <div className="hint">Conecte o servidor da equipe para gerar links de revisão reais com aprovação por tomada.</div>
+            <button className="btn" onClick={() => setModal({ kind: "nuvem" })}><Settings size={13} />Conectar servidor…</button>
+          </div>
+        )}
+        <SectionLabel>Enviar arquivos</SectionLabel>
         <div className="col" style={{ gap: 6 }}>
-          <button className="btn" disabled>Link de revisão com aprovação do cliente <Stamp kind="f2" /></button>
-          <button className="btn" disabled>Comentários multiusuário em tempo real <Stamp kind="f2" /></button>
+          <button className="btn" onClick={exportJSON}><FileJson size={13} />Arquivo do projeto (JSON)</button>
+          <button className="btn" onClick={doCapture}><ImageIcon size={13} />Imagem do quadro atual</button>
+          <button className="btn" onClick={() => { setModal(null); doRecord(); }}><Film size={13} />Prévia em vídeo (WebM)</button>
         </div>
+        <SectionLabel>Fase 3</SectionLabel>
+        <button className="btn" disabled>Comentários multiusuário em tempo real <Stamp kind="f2">Fase 3</Stamp></button>
+      </Modal>
+    );
+    if (K === "nuvem") return (
+      <Modal title="Servidor da equipe (Fase 2)" icon={Share2} onClose={() => setModal(null)} width={500}
+        footer={<>
+          {cloudOn && <button className="btn ghost danger" onClick={() => { saveCloudCfg(null); setModal(null); toast("Servidor desconectado deste navegador.", "info"); }}>Desconectar</button>}
+          <span style={{ flex: 1 }} />
+          <button className="btn ghost" onClick={() => setModal(null)}>Fechar</button>
+          <button className="btn primary" disabled={cloudBusy || !(modal.url || (cloud && cloud.url))} onClick={async () => {
+            const cfg = { url: (modal.url ?? (cloud && cloud.url)) || "", key: (modal.key ?? (cloud && cloud.key)) || "" };
+            setCloudBusy(true);
+            try {
+              const h = await apiReq(cfg, "/api/health");
+              if (!h.ok) throw new Error("Resposta inesperada do servidor.");
+              saveCloudCfg(cfg);
+              toast("Servidor conectado — projetos e maquetes agora persistem na nuvem.", "ok", 6000);
+              setModal({ kind: "menu" });
+            } catch (e) { toast(`Não conectou: ${e.message}`, "err", 7000); }
+            finally { setCloudBusy(false); }
+          }}>{cloudBusy ? <Loader2 size={13} className="spin" /> : <Check size={13} />}Testar e conectar</button>
+        </>}>
+        <div className="hint" style={{ marginBottom: 10 }}>Aponte para a SceneFlow API da equipe (pasta <span className="mono">server/</span> do projeto — Node, hospedável de graça em Render/Railway). Com ela, os itens FASE 2 abaixo tornam-se reais: <b>projetos na nuvem</b>, <b>maquetes importadas persistentes</b>, <b>link de revisão do cliente</b> e <b>fila de conversão no servidor</b>.</div>
+        <Field label="URL da API"><input placeholder="https://sceneflow-api.onrender.com" defaultValue={cloud ? cloud.url : ""} onChange={(e) => setModal(m => ({ ...m, url: e.target.value.trim() }))} /></Field>
+        <Field label="Chave da equipe"><input type="password" placeholder="TEAM_KEY definida no servidor" defaultValue={cloud ? cloud.key : ""} onChange={(e) => setModal(m => ({ ...m, key: e.target.value.trim() }))} /></Field>
+        <div className="hint">A chave fica salva só neste navegador e vai em cada requisição (cabeçalho X-PH-Key). Links de revisão de clientes não exigem chave — o token do link é o segredo.</div>
+      </Modal>
+    );
+    if (K === "nuvem-abrir") return (
+      <Modal title="Abrir projeto da nuvem" icon={FolderOpen} onClose={() => setModal(null)} width={520}>
+        {!(modal.list || []).length && <div className="hint">Nenhum projeto na nuvem ainda — use “Salvar na nuvem” no menu.</div>}
+        <div className="col" style={{ gap: 6 }}>
+          {(modal.list || []).map(p => (
+            <button key={p.id} className="card row" style={{ gap: 10, cursor: "pointer", textAlign: "left" }} disabled={cloudBusy} onClick={() => cloudOpenProject(p.id)}>
+              <FolderOpen size={15} style={{ color: "var(--accent)", flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <b style={{ fontSize: 12 }}>{p.name}</b>
+                <div className="hint">{p.client || "—"} · {p.type || "—"}</div>
+              </div>
+              <span className="mono" style={{ fontSize: 10, color: "var(--tx3)" }}>{new Date(p.updated_at).toLocaleString("pt-BR")}</span>
+            </button>
+          ))}
+        </div>
+        <div className="hint" style={{ marginTop: 10 }}>Abrir substitui o projeto atual (o estado atual entra no histórico de desfazer). Maquetes com cópia na nuvem são baixadas e reposicionadas automaticamente.</div>
       </Modal>
     );
     if (K === "config") return (
@@ -3780,4 +4059,148 @@ export default function App() {
       </div>
     </div>
   );
+}
+
+
+// ============================================================================
+// 13. PÁGINA DE REVISÃO DO CLIENTE (aberta pelo link ?review=TOKEN&api=URL)
+//     Sem chave de equipe: o token é o segredo. Sem 3D — leve e direta.
+// ============================================================================
+function ReviewPage({ token, api }) {
+  const cfg = { url: api, key: "" };
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [author, setAuthor] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [drafts, setDrafts] = useState({});
+  const [sent, setSent] = useState(0);
+  const load = useCallback(async () => {
+    try { setData(await apiReq(cfg, `/api/public/reviews/${token}`, { pub: true })); setErr(null); }
+    catch (e) { setErr(e.message); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, api]);
+  useEffect(() => { load(); }, [load]);
+
+  const send = async (path, json, okMsg) => {
+    if (!author.trim()) { setErr("Informe seu nome antes de enviar."); return; }
+    setBusy(true); setErr(null);
+    try {
+      await apiReq(cfg, path, { method: "POST", json: { ...json, author: author.trim() }, pub: true });
+      await load();
+      setSent(s => s + 1);
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+  const decisionOf = (shotId) => {
+    if (!data) return null;
+    const list = data.approvals.filter(a => a.shot_id === shotId);
+    return list.length ? list[list.length - 1] : null;
+  };
+  if (err && !data) return (
+    <div className="phsf" style={{ alignItems: "center", justifyContent: "center" }}>
+      <style>{CSS}</style>
+      <div className="card" style={{ maxWidth: 420, textAlign: "center" }}>
+        <AlertTriangle size={22} style={{ color: "var(--warn)" }} />
+        <div style={{ marginTop: 8, fontWeight: 600 }}>Não foi possível abrir a revisão</div>
+        <div className="hint" style={{ marginTop: 4 }}>{err}</div>
+      </div>
+    </div>
+  );
+  if (!data) return (
+    <div className="phsf" style={{ alignItems: "center", justifyContent: "center" }}>
+      <style>{CSS}</style>
+      <div className="row" style={{ gap: 10, color: "var(--tx2)" }}><Loader2 size={18} className="spin" />Carregando revisão…</div>
+    </div>
+  );
+  const P = data.payload;
+  return (
+    <div className="phsf" style={{ overflowY: "auto", display: "block", userSelect: "text" }}>
+      <style>{CSS}</style>
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "26px 20px 60px" }}>
+        <div className="row" style={{ gap: 10 }}>
+          <span style={{ width: 30, height: 30, borderRadius: 7, background: "var(--accent)", color: "var(--accent-ink)", display: "grid", placeItems: "center", fontWeight: 800, fontSize: 13 }}>PH</span>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>{P.projectName}</div>
+            <div className="hint">Revisão de storyboard · {P.shots.length} tomadas · {fmtT(P.total || 0)} · formato {P.aspect}{P.client ? ` · ${P.client}` : ""}</div>
+          </div>
+          <span style={{ flex: 1 }} />
+          <button className="btn sm ghost" onClick={load} disabled={busy}>Atualizar</button>
+        </div>
+        <div className="card row" style={{ margin: "16px 0", gap: 10 }}>
+          <PersonStanding size={15} style={{ color: "var(--accent)" }} />
+          <label style={{ fontSize: 12, color: "var(--tx2)" }}>Seu nome</label>
+          <input value={author} onChange={(e) => setAuthor(e.target.value)} placeholder="ex.: Marcos — Incorporadora Horizonte" style={{ flex: 1 }} />
+          {sent > 0 && <span className="row" style={{ gap: 5, color: "var(--ok)", fontSize: 11 }}><CheckCircle2 size={13} />{sent} envio(s) registrado(s)</span>}
+        </div>
+        {err && <div className="hint" style={{ color: "var(--err)", marginBottom: 10 }}>{err}</div>}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 14 }}>
+          {P.shots.map((s2, i) => {
+            const dec = decisionOf(s2.id);
+            const cms = data.comments.filter(c => c.shot_id === s2.id);
+            return (
+              <div key={s2.id} className="card" style={{ padding: 0, overflow: "hidden" }}>
+                <div style={{ aspectRatio: "16/9", background: s2.thumb ? `url(${s2.thumb}) center/cover` : "var(--bg3)", position: "relative" }}>
+                  <span className="mono" style={{ position: "absolute", left: 8, top: 7, fontSize: 10, background: "rgba(15,17,21,.8)", padding: "1px 6px", borderRadius: 4 }}>{i + 1}</span>
+                  <span className="mono" style={{ position: "absolute", right: 8, bottom: 7, fontSize: 10, background: "rgba(15,17,21,.8)", padding: "1px 6px", borderRadius: 4 }}>{(s2.dur || 0).toFixed(1)} s</span>
+                  {dec && (
+                    <span style={{ position: "absolute", right: 8, top: 7, fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: dec.decision === "aprovado" ? "var(--ok)" : "var(--warn)", color: "#101418" }}>
+                      {dec.decision === "aprovado" ? "APROVADA" : "AJUSTES"}
+                    </span>
+                  )}
+                </div>
+                <div style={{ padding: "10px 12px" }}>
+                  <b style={{ fontSize: 12 }}>{s2.name}</b>
+                  <div className="hint" style={{ marginBottom: 8 }}>{s2.move}</div>
+                  {cms.map((c, j) => (
+                    <div key={j} style={{ fontSize: 11, padding: "5px 8px", background: "var(--bg3)", borderRadius: 6, marginBottom: 4 }}>
+                      <b style={{ color: "var(--tx2)" }}>{c.author}:</b> {c.text}
+                    </div>
+                  ))}
+                  <div className="row" style={{ gap: 5, marginTop: 6 }}>
+                    <input placeholder="Comentar esta tomada…" value={drafts[s2.id] || ""} onChange={(e) => setDrafts(d => ({ ...d, [s2.id]: e.target.value }))}
+                      onKeyDown={(e) => { if (e.key === "Enter" && (drafts[s2.id] || "").trim()) { send(`/api/public/reviews/${token}/comments`, { shotId: s2.id, text: drafts[s2.id].trim() }); setDrafts(d => ({ ...d, [s2.id]: "" })); } }}
+                      style={{ flex: 1, fontSize: 11 }} />
+                    <button className="iconbtn" disabled={busy || !(drafts[s2.id] || "").trim()} title="Enviar comentário"
+                      onClick={() => { send(`/api/public/reviews/${token}/comments`, { shotId: s2.id, text: drafts[s2.id].trim() }); setDrafts(d => ({ ...d, [s2.id]: "" })); }}>
+                      <MessageSquare size={13} />
+                    </button>
+                  </div>
+                  <div className="row" style={{ gap: 6, marginTop: 8 }}>
+                    <button className="btn sm" style={{ flex: 1, borderColor: "var(--ok)", color: "var(--ok)" }} disabled={busy}
+                      onClick={() => send(`/api/public/reviews/${token}/approvals`, { shotId: s2.id, decision: "aprovado" })}>
+                      <Check size={12} />Aprovar
+                    </button>
+                    <button className="btn sm" style={{ flex: 1, borderColor: "var(--warn)", color: "var(--warn)" }} disabled={busy}
+                      onClick={() => send(`/api/public/reviews/${token}/approvals`, { shotId: s2.id, decision: "ajustes", note: (drafts[s2.id] || "").trim() })}>
+                      <PenLine size={12} />Pedir ajustes
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="card" style={{ marginTop: 16 }}>
+          <SectionLabel>Comentário geral do vídeo</SectionLabel>
+          <div className="row" style={{ gap: 6 }}>
+            <input placeholder="Observações sobre o vídeo como um todo…" value={drafts.__geral || ""} onChange={(e) => setDrafts(d => ({ ...d, __geral: e.target.value }))} style={{ flex: 1 }} />
+            <button className="btn sm primary" disabled={busy || !(drafts.__geral || "").trim()}
+              onClick={() => { send(`/api/public/reviews/${token}/comments`, { shotId: null, text: drafts.__geral.trim() }); setDrafts(d => ({ ...d, __geral: "" })); }}>Enviar</button>
+          </div>
+          {data.comments.filter(c => !c.shot_id).map((c, j) => (
+            <div key={j} style={{ fontSize: 11, padding: "5px 8px", background: "var(--bg3)", borderRadius: 6, marginTop: 6 }}>
+              <b style={{ color: "var(--tx2)" }}>{c.author}:</b> {c.text}
+            </div>
+          ))}
+        </div>
+        <div className="hint" style={{ marginTop: 16, textAlign: "center" }}>Suas respostas ficam registradas para a equipe Pixel Hub sincronizar no projeto. Pixel Hub SceneFlow.</div>
+      </div>
+    </div>
+  );
+}
+
+// Raiz: decide entre o aplicativo completo e a página de revisão do cliente
+export default function Root() {
+  const rv = useMemo(parseReviewLink, []);
+  return rv ? <ReviewPage token={rv.token} api={rv.api} /> : <App />;
 }

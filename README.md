@@ -29,3 +29,13 @@ Abra o endereço mostrado (normalmente http://localhost:5173) no Chrome ou Edge.
 - A geometria de maquetes importadas (GLB/glTF/OBJ/ZIP) não persiste entre sessões — o app avisa e pede a reimportação; correções e transformações são reaplicadas.
 - Convenções de honestidade da interface: sem carimbo = funciona de verdade; DEMONSTRAÇÃO = interface real com resultado simulado; FASE 2 = depende de backend (conversão SKP/DWG, render MP4/4K, colaboração).
 - Arquitetura, modelo de dados e roadmap: ver `ARQUITETURA-E-ROADMAP.md`.
+
+
+## Fase 2 — nuvem da equipe (opcional, recomendado)
+
+A pasta `server/` contém a **SceneFlow API** (Node + SQLite, sem dependências nativas), que torna reais:
+projetos salvos na nuvem entre máquinas, **persistência das maquetes importadas**, **link de revisão do
+cliente** (comenta e aprova/pede ajustes por tomada, sem senha) e fila de conversão com arquivo
+armazenado no servidor. Deploy gratuito em Render/Railway — instruções em `server/README.md`.
+No app: menu **PH SceneFlow → Conectar servidor da equipe…**. Sem servidor, o app continua 100% funcional
+localmente (os recursos de nuvem ficam marcados como Fase 2, como sempre).
